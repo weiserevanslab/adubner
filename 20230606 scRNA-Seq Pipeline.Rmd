@@ -1,0 +1,353 @@
+---
+title: "Single Cell Pipeline"
+author: "Allison M. Dubner, Weiser-Evans Lab"
+date: "6/6/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Libraries
+This loads the libraries I used in my analysis
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggplot2)
+library(scDblFinder)
+library(BiocParallel)
+library(pheatmap)
+library(stringr)
+
+library(dittoSeq)
+library(enrichR)
+library(ggpubr)
+library(CellChat)h
+```
+
+
+#Loading Cell Ranger Matrix and creating the Seurat object
+
+```{r}
+dataset_loc <- "/mnt/allison/allison_out/output/"
+
+sample_ids <- c("16wk_athero_YFP_minus", "16wk_athero_YFP_plus", "16wk_control_YFP_minus", "16wk_control_YFP_plus", "8wk_athero_YFP_minus", "8wk_athero_YFP_plus", "Klf4_16wk_athero_YFP_minus", "Klf4_16wk_athero_YFP_plus", "Klf4_16wk_control_YFP_minus", "Klf4_16wk_control_YFP_plus", "Klf4_baseline_YFP_minus", "Klf4_baseline_YFP_plus", "Vessels_baseline_YFP_minus", "Vessels_baseline_YFP_plus")
+
+
+d10x.data <- sapply(sample_ids, function(i){
+  d10x <- Read10X(file.path(dataset_loc,i,"outs/filtered_feature_bc_matrix"))
+  colnames(d10x) <- paste(sapply(strsplit(colnames(d10x),split="-"),'[[',1L),i,sep="-")
+  d10x
+})
+
+experiment.data <- do.call("cbind", d10x.data)
+
+experiment.aggregate <- CreateSeuratObject(
+  experiment.data,
+  project = "Allison_Athero",
+  min.cells = 10,
+  min.features = 200,
+  names.field = 2,
+  names.delim = "\\-")
+
+saveRDS(experiment.aggregate, "/mnt/allison/Output/combinedinitialdata_no8wkcontrol.rds")
+```
+
+#Doublet detection
+Using scdblfinder to detect likely doublets, then remove them from the dataset
+
+```{r}
+experiment.aggregate.dbl.rmv <- readRDS("/mnt/allison/Output/combinedinitialdata_no8wkcontrol.rds")
+experiment.aggregate.dbl.rmv <- as.SingleCellExperiment(experiment.aggregate.dbl.rmv)
+
+experiment.aggregate.dbl.rmv <- scDblFinder(experiment.aggregate.dbl.rmv, samples="orig.ident", BPPARAM=MulticoreParam(3))
+
+#Save this after running the doublet detection
+saveRDS(experiment.aggregate.dbl.rmv, "/mnt/allison/experiment.aggregate.dbl.rds")
+
+experiment.aggregate.dbl.rmv <-as.Seurat(experiment.aggregate.dbl.rmv)
+
+table(experiment.aggregate.dbl.rmv$scDblFinder.class)
+
+experiment.aggregate.dbl.rmv <- subset(experiment.aggregate.dbl.rmv, scDblFinder.class != "doublet")
+```
+
+#Starting QC
+Investigating the data to help determine filtering thresholds and detect any issues with the data
+```{r}
+#What percent of reads map to mitochondrial genome
+experiment.aggregate.dbl.rmv$percent.mito <- PercentageFeatureSet(experiment.aggregate.dbl.rmv, pattern = "^mt-")
+
+#Expression of YFP transgene
+experiment.aggregate.dbl.rmv$percent.eYFP <- PercentageFeatureSet(experiment.aggregate.dbl.rmv, features = "eYFP")
+
+Idents(experiment.aggregate.dbl.rmv) <- experiment.aggregate.dbl.rmv@meta.data$orig.ident
+
+do.call("cbind", tapply(experiment.aggregate.dbl.rmv$nFeature_RNA, Idents(experiment.aggregate.dbl.rmv),quantile,probs=seq(0,1,0.05)))
+RidgePlot(experiment.aggregate.dbl.rmv, features="nFeature_RNA")
+
+do.call("cbind", tapply(experiment.aggregate.dbl.rmv$nCount_RNA, Idents(experiment.aggregate.dbl.rmv),quantile,probs=seq(0,1,0.05)))
+RidgePlot(experiment.aggregate.dbl.rmv, features="nCount_RNA")
+
+round(do.call("cbind", tapply(experiment.aggregate.dbl.rmv$percent.mito, Idents(experiment.aggregate.dbl.rmv),quantile,probs=seq(0,1,0.05))), digits = 3)
+RidgePlot(experiment.aggregate.dbl.rmv, features= "percent.mito")
+
+plot(sort(Matrix::rowSums(GetAssayData(experiment.aggregate.dbl.rmv) >= 3)) , xlab="gene rank", ylab="number of cells", main="Cells per genes (reads/gene >= 3 )")
+
+ggplot(experiment.aggregate.dbl.rmv@meta.data, aes(x = nCount_RNA, y = nFeature_RNA, color = percent.mito)) +
+                geom_point(size = 0.5) +
+                scale_color_gradient() + theme_classic()
+```
+
+#Cell filtering
+```{r}
+experiment.aggregate.dbl.rmv <- subset(experiment.aggregate.dbl.rmv, nFeature_RNA > 500 & 
+   nFeature_RNA < 6500 & 
+   nCount_RNA > 500 &
+   nCount_RNA < 45000 &
+   percent.mito < 15)
+
+FeatureScatter(
+  experiment.aggregate.dbl.rmv, "nCount_RNA", "nFeature_RNA",
+  pt.size = 0.5)
+```
+
+#Normalize data
+```{r}
+experiment.aggregate.dbl.rmv <- NormalizeData(
+  object = experiment.aggregate.dbl.rmv,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000)
+```
+
+#Identify variable genes
+```{r}
+experiment.aggregate.dbl.rmv <- FindVariableFeatures(
+  object = experiment.aggregate.dbl.rmv,
+  selection.method = "vst")
+
+top10 <- head(VariableFeatures(experiment.aggregate.dbl.rmv), 10)
+
+var.feat1 <- VariableFeaturePlot(experiment.aggregate.dbl.rmv)
+var.feat2 <- LabelPoints(plot = var.feat1, points = top10, repel = TRUE)
+var.feat2
+```
+
+#Scaling data & PCA
+```{r}
+experiment.aggregate.dbl.rmv <-ScaleData(experiment.aggregate.dbl.rmv)
+
+experiment.aggregate.dbl.rmv <- RunPCA(experiment.aggregate.dbl.rmv, features = VariableFeatures(object = experiment.aggregate.dbl.rmv), npcs = 50)
+print(experiment.aggregate.dbl.rmv[["pca"]], dims = 1:5, nfeatures = 5)
+```
+
+#Accounting for YFP
+Don't want YFP expression driving clustering, so removing it from variable features
+```{r}
+table(grepl("eYFP", VariableFeatures(experiment.aggregate.dbl.rmv)))
+
+VariableFeatures(experiment.aggregate.dbl.rmv) <-
+  VariableFeatures(experiment.aggregate.dbl.rmv)[!grepl("eYFP", VariableFeatures(experiment.aggregate.dbl.rmv))]
+```
+
+#Selecting PCs to use
+
+```{r}
+ElbowPlot(experiment.aggregate.dbl.rmv, ndims = 50)
+
+experiment.aggregate.dbl.rmv <- ScoreJackStraw(experiment.aggregate.dbl.rmv, dims = 1:50)
+
+JackStrawPlot(object = experiment.aggregate.dbl.rmv, dims = 1:50)
+
+use.pcs = 1:50
+```
+
+#UMAPs
+```{r}
+set.seed(42)
+
+experiment.aggregate.dbl.rmv <- RunUMAP(experiment.aggregate.dbl.rmv, dims = use.pcs)
+
+DimPlot(experiment.aggregate.dbl.rmv, reduction = "umap", group.by = "orig.ident", shuffle=T)
+```
+
+#Clustering
+```{r}
+experiment.aggregate.dbl.rmv <- FindNeighbors(experiment.aggregate.dbl.rmv, reduction="pca", dims = use.pcs)
+
+experiment.aggregate.dbl.rmv <- FindClusters(
+    object = experiment.aggregate.dbl.rmv,
+    resolution = seq(0.5,3,0.5),
+    verbose = FALSE)
+```
+
+
+```{r}
+Idents(experiment.aggregate.dbl.rmv) <- experiment.aggregate.dbl.rmv$RNA_snn_res.0.5
+
+table(Idents(experiment.aggregate.dbl.rmv),experiment.aggregate.dbl.rmv$orig.ident)
+
+table(Idents(experiment.aggregate.dbl.rmv))
+
+saveRDS(experiment.aggregate.dbl.rmv, file = paste("/mnt/allison/Output/", Sys.Date(), "_dblrmv_data_analyzed.rds", sep = ""))
+```
+
+#Find unique markers
+```{r}
+markers_all_new <- FindAllMarkers(
+    object = experiment.aggregate.dbl.rmv,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    thresh.use = 0.25)
+
+markers_all_single_new <- markers_all_new[markers_all_new$gene %in% names(table(markers_all_new$gene))[table(markers_all_new$gene) == 1],]
+
+write.csv(markers_all_new, file = paste("/mnt/allison/Output/", Sys.Date(), "_dblrmv_cluster_markers.csv", sep = ""))
+markers_all_tib_new <- as_tibble(markers_all_new)
+
+
+Top6_markers_new <- c()
+clusters <- 0:25
+for (val in clusters) {
+  temp <- filter(markers_all_tib_new, cluster == val) %>% head(n=10) %>% .$gene
+  Top6_markers_new <- append(Top6_markers_new, temp)
+}
+Top_markers_unique <- unique(Top6_markers_new)
+```
+
+#Confusion matrix
+To confirm no batch effects, used confusion matrix to look at the clustering vs. origin.ident. There were no unexpected differences.
+```{r}
+confusionMatrix <- function(i = NULL, j = NULL){
+  ui <- unique(i)
+  uj <- unique(j)
+  m <- Matrix::sparseMatrix(
+    i = match(i, ui),
+    j = match(j, uj),
+    x = rep(1, length(i)),
+    dims = c(length(ui), length(uj))
+  )
+  rownames(m) <- ui
+  colnames(m) <- uj
+  m
+}
+
+cM <- confusionMatrix(i = experiment.aggregate.dbl.rmv$orig.ident, j = experiment.aggregate.dbl.rmv$RNA_snn_res.0.5)
+
+cM <- data.frame(cM)
+cM / rowSums(cM)
+
+pheatmap(cM/rowSums(cM))
+```
+
+#Adding some useful metadata
+```{r}
+exp.aggregate <- subset(experiment.aggregate.dbl.rmv, idents = c("16wk_athero_YFP_minus", "16wk_athero_YFP_plus", "16wk_control_YFP_minus", "16wk_control_YFP_plus", "Klf4_16wk_athero_YFP_minus",  "Klf4_16wk_athero_YFP_plus", "Klf4_16wk_control_YFP_minus", "Klf4_16wk_control_YFP_plus" ,"Klf4_baseline_YFP_minus","Klf4_baseline_YFP_plus","Vessels_baseline_YFP_minus", "Vessels_baseline_YFP_plus"))
+
+exp.aggregate@meta.data[c('genotype', 'timepoint', 'treatment', 'YFP')] <- as.factor(str_split_fixed(exp.aggregate@meta.data$temp_ids, "_", 4))
+
+exp.aggregate@meta.data <- subset(exp.aggregate@meta.data, select = -temp_ids)
+
+Idents(exp.aggregate) <-exp.aggregate$orig.ident
+
+exp.aggregate@meta.data$temp_ids <- as.character(exp.aggregate@meta.data$orig.ident)
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "16wk_athero_YFP_minus"] <- "WT_16wk_athero"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "16wk_athero_YFP_plus"] <- "WT_16wk_athero"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "16wk_control_YFP_minus"] <- "WT_16wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "16wk_control_YFP_plus"] <- "WT_16wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_16wk_athero_YFP_minus"] <- "KO_16wk_athero"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_16wk_athero_YFP_plus"] <- "KO_16wk_athero"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_16wk_control_YFP_minus"] <- "KO_16wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_16wk_control_YFP_plus"] <- "KO_16wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_baseline_YFP_minus"] <- "KO_0wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Klf4_baseline_YFP_plus"] <- "KO_0wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Vessels_baseline_YFP_minus"] <- "WT_0wk_control"
+
+exp.aggregate@meta.data$temp_ids[exp.aggregate@meta.data$temp_ids == "Vessels_baseline_YFP_plus"] <- "WT_0wk_control"
+
+exp.aggregate@meta.data['condition'] <-exp.aggregate@meta.data$temp_ids
+```
+
+#Renaming Clusters
+```{r}
+Idents(exp.aggregate) <- exp.aggregate@meta.data$RNA_snn_res.0.5
+
+exp.aggregate <- RenameIdents(
+  object = exp.aggregate,
+"0"	=	"SMC_1"	,
+"1"	=	"Fib_1"	,
+"2"	=	"Fib_2"	,
+"3"	=	"Fib_3"	,
+"4"	=	"Fib_4"	,
+"5"	=	"AdvSca1-SM"	,
+"6"	=	"Endo_2"	,
+"7"	=	"Mac_1"	,
+"8"	=	"Transitional"	,
+"9"	= "SMC_3"	,
+"10"	=	"Endo_1"	,
+"11"	=	"Mac_2"	,
+"12"	=	"SMC_4"	,
+"13"	=	"Fib_5",
+"14"	=	"T_1" ,
+"15"	=	"T_2" ,
+"16"	=	"Mac_3" ,
+"17"	=	"Neural" ,
+"18"	=	"Mac_4" ,
+"19"	=	"Granulocyte"	,
+"20"	=	"B"	,
+"21"	=	"Epicardial"	,
+"22"	=	"Unk_1"	,
+"23"	=	"Unk_2"	,
+"24"	=	"Unk_3"	,
+"25"	=	"CM"
+)
+
+exp.aggregate <- StashIdent(exp.aggregate, save.name = "clusters")
+```
+
+#Keeping colors consistent for figures
+```{r}
+custom_colors <- list()
+
+colors_aussie <- c(
+  "#f6e58d","#ffbe76","#ff7979","#badc58","#dff9fb",
+  "#f9ca24","#f0932b","#eb4d4b","#6ab04c","#c7ecee",
+  "#7ed6df","#e056fd","#686de0","#30336b","#95afc0",
+  "#22a6b3","#be2edd","#4834d4","#130f40","#535c68"
+)
+
+colors_british <- c(
+  "#00a8ff","#9c88ff","#fbc531","#4cd137","#487eb0",
+  "#0097e6","#8c7ae6","#e1b12c","#44bd32","#40739e",
+  "#e84118","#f5f6fa","#7f8fa6","#273c75","#353b48",
+  "#c23616","#dcdde1","#718093","#192a56","#2f3640"
+)
+
+fib_colors <- c("#56b4e9", "#009e73", "#f0e442", "#0072b2")
+
+
+custom_colors$discrete <- c(colors_aussie, colors_british)
+length(custom_colors$discrete)
+
+colors_blind <- c(
+  '#000000', '#252525',  '#997700', '#676767', '#171723', '#004949', '#009999', '#22cf22', 
+  '#490092','#006ddb', '#b66dff', '#ff6db6', '#920000', '#8f4e00', '#db6d00', '#ffdf4d')
+
+cluster_colors <- custom_colors$discrete[1:26]
+names(cluster_colors) <- levels(exp.aggregate@meta.data$clusters)
+
+orig_colors <-custom_colors$discrete[1:16]
+names(orig_colors) <- levels(exp.aggregate@meta.data$orig.ident)
+```
